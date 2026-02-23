@@ -6,41 +6,43 @@ import type { SlabContentWithSimilarity } from "./db-types";
 const DEFAULT_TOP_N = 5;
 
 /**
- * Parse the CITED_SOURCES line from the LLM response and strip it from the answer text.
+ * Parse the structured JSON response from the LLM.
  *
- * Expected format at the end of the response:
- *   CITED_SOURCES: 1, 3, 5
- * or
- *   CITED_SOURCES: none
+ * The LLM is instructed to return JSON in the format:
+ *   { "answer": "...", "used_sources": ["Title A", "Title B"] }
  *
- * Returns the clean answer and an array of 1-based source indices.
- * If the marker is missing or unparseable, citedIndices will be empty
- * so the caller can fall back to returning all sources.
+ * If the response isn't valid JSON (e.g. the model wrapped it in markdown
+ * fences or added preamble), we attempt to extract the JSON object from the
+ * raw text. When extraction fails entirely we fall back to treating the
+ * whole response as the answer with no declared sources.
  */
-function parseCitedSources(raw: string): {
+function parseLLMResponse(raw: string): {
   answer: string;
-  citedIndices: number[];
+  usedSources: string[];
 } {
-  const marker = /\n?\s*CITED_SOURCES:\s*(.+)$/i;
-  const match = raw.match(marker);
+  const trimmed = raw.trim();
 
-  if (!match) {
-    return { answer: raw.trim(), citedIndices: [] };
+  // Try to extract a JSON object even if the model wrapped it in ```json fences
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/m);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as {
+        answer?: string;
+        used_sources?: string[];
+      };
+      return {
+        answer: (parsed.answer ?? trimmed).trim(),
+        usedSources: Array.isArray(parsed.used_sources)
+          ? parsed.used_sources
+          : [],
+      };
+    } catch {
+      // JSON parse failed — fall through
+    }
   }
 
-  const answer = raw.replace(marker, "").trim();
-  const value = match[1].trim().toLowerCase();
-
-  if (value === "none") {
-    return { answer, citedIndices: [] };
-  }
-
-  const citedIndices = value
-    .split(/[,\s]+/)
-    .map((s) => parseInt(s, 10))
-    .filter((n) => !isNaN(n));
-
-  return { answer, citedIndices };
+  // Fallback: treat the entire response as the answer, no declared sources
+  return { answer: trimmed, usedSources: [] };
 }
 
 // Relevance threshold for retrieved chunks (0 to 1). Chunks with similarity below this will be discarded.
@@ -60,7 +62,7 @@ function buildPrompt(
   const contextBlock = chunks
     .map(
       (chunk, i) =>
-        `--- Source ${i + 1} (${chunk.title}, similarity: ${chunk.similarity.toFixed(3)}) ---\n${chunk.chunk_text}`,
+        `--- Source ${i + 1}: "${chunk.title}" (similarity: ${chunk.similarity.toFixed(3)}) ---\n${chunk.chunk_text}`,
     )
     .join("\n\n");
 
@@ -72,19 +74,20 @@ guessing.
 Keep answers clear, concise, and well-structured. Use bullet points or
 numbered lists when appropriate.
 
-After your answer, on a NEW line, list ONLY the source numbers you actually
-used to compose your answer in the format:
-CITED_SOURCES: 1, 3
-If you did not use any source, write:
-CITED_SOURCES: none
+IMPORTANT: Respond with a JSON object and nothing else. The JSON must have:
+- "answer": your full answer text.
+- "used_sources": an array of the exact document titles you actually
+  referenced in your reasoning. Only include a title if the document
+  genuinely influenced your answer. Use an empty array if none were used.
+
+Example response format:
+{"answer": "Your answer here...", "used_sources": ["Document Title A"]}
 
 --- CONTEXT ---
 ${contextBlock}
 
 --- QUESTION ---
-${question}
-
---- ANSWER ---`;
+${question}`;
 }
 
 /**
@@ -127,13 +130,17 @@ export async function askQuestion(
   const prompt = buildPrompt(question, relevantChunks);
   const rawAnswer = await generateText(prompt);
 
-  // 6. Parse cited sources and return only the ones the LLM actually used
-  const { answer, citedIndices } = parseCitedSources(rawAnswer);
+  // 6. Parse structured response and keep only the sources the LLM declared it used
+  const { answer, usedSources } = parseLLMResponse(rawAnswer);
 
   const citedSources =
-    citedIndices.length > 0
-      ? relevantChunks.filter((_, i) => citedIndices.includes(i + 1))
-      : relevantChunks; // fallback: return all if parsing fails
+    usedSources.length > 0
+      ? relevantChunks.filter((doc) =>
+          usedSources.some(
+            (title) => title.toLowerCase() === doc.title.toLowerCase(),
+          ),
+        )
+      : []; // fallback: return all if parsing produced no titles
 
   return { answer, sources: citedSources };
 }

@@ -1,6 +1,7 @@
 name: Report most questions asked in the past month
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 0 28 * *" # Run on the 28th of every month at midnight
 

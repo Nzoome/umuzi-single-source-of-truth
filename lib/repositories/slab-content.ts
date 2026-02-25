@@ -141,3 +141,12 @@ export async function countSlabContent(): Promise<number> {
   );
   return parseInt(result.rows[0].count, 10);
 }
+
+// Fetch all chunks that belong to a given document title.
+export async function getChunksByTitle(title: string): Promise<SlabContent[]> {
+  const result = await query<SlabContent>(
+    `SELECT * FROM slab_content WHERE title = $1 ORDER BY id ASC`,
+    [title],
+  );
+  return result.rows;
+}

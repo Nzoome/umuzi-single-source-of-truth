@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 export async function GET() {
   return NextResponse.json({
-    text: "Hello! This is Zazu's Cousin. The app is running successfully.",
+    text: "Hello! This is Zazu. The app is running successfully.",
   });
 }
 
@@ -14,7 +14,7 @@ export async function GET() {
  */
 export async function POST() {
   return NextResponse.json({
-    text: "Hello! This is Zazu's Cousin. The app is running successfully.",
+    text: "Hello! This is Zazu. The app is running successfully.",
     response_type: "in_channel",
   });
 }

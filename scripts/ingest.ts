@@ -1,5 +1,5 @@
 /**
- * Triggers content ingestion by POSTing to the /api/ingest endpoint.
+ * Triggers content ingestion by POSTing to the /api/ingest-markdown endpoint.
  *
  * Required env vars:
  *   HOST_URL            – base URL of the deployed app
@@ -23,7 +23,7 @@ if (!INGEST_SECRET_CODE) {
 }
 
 async function main() {
-  const url = `${HOST_URL}/api/ingest`;
+  const url = `${HOST_URL}/api/ingest-markdown`;
   console.log(`Triggering ingestion at ${url} ...`);
 
   const response = await fetch(url, {

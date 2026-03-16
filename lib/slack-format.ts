@@ -17,7 +17,8 @@
  *     an italic span (`_ _`), mangling the rest of the line.
  *  2. Headings, bold, and italic are resolved in a single regex pass so that the
  *     `*text*` output from bold/heading conversion is never re-matched as italic.
- */ export function mdToSlack(md: string): string {
+ */
+export function mdToSlack(md: string): string {
   return (
     md
       // 1. Bullets first
@@ -47,14 +48,15 @@
  *   • <https://github.com/…|Title> (relevance 87%)
  *
  * Falls back to plain italic title when no URL is available.
+ * Supports both Slab (GitHub) and Google Docs sources.
  */
 export function formatSources(
-  sources: { title: string; slab_url: string | null; similarity: number }[],
+  sources: { title: string; source_url: string | null; similarity: number }[],
 ): string {
   return sources
     .map((s) => {
-      const citation = s.slab_url
-        ? `<${s.slab_url}|${s.title}>`
+      const citation = s.source_url
+        ? `<${s.source_url}|${s.title}>`
         : `_${s.title}_`;
       return `• ${citation} (relevance ${(s.similarity * 100).toFixed(0)}%)`;
     })

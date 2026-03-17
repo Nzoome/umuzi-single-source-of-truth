@@ -3,10 +3,33 @@ import {
   searchByEmbedding,
   getChunksByTitle,
 } from "./repositories/slab-content";
-import type { SlabContentWithSimilarity } from "./db-types";
+import {
+  searchGoogleDocsByEmbedding,
+  getGoogleDocsChunksByTitle,
+} from "./repositories/google-docs-content";
+import type { SlabContentWithSimilarity, GoogleDocsContentWithSimilarity } from "./db-types";
 
-// Default number of top relevant chunks to retrieve for context. Can be overridden by caller.
+// Default number of top relevant chunks to retrieve per source. Can be overridden by caller.
 const DEFAULT_TOP_N = 10;
+
+// Relevance threshold for retrieved chunks (0 to 1). Chunks with similarity below this will be discarded.
+const RELEVANCE_THRESHOLD = 0.3;
+
+// Unified source type that works for both Slab and Google Docs content
+export interface UnifiedChunk {
+  id: number;
+  title: string;
+  chunk_text: string;
+  similarity: number;
+  source_url: string | null;
+  source_type: "slab" | "google_docs";
+}
+
+// Interface for the RAG result returned by askQuestion()
+export interface RAGResult {
+  answer: string;
+  sources: UnifiedChunk[];
+}
 
 /**
  * Parse the structured JSON response from the LLM.
@@ -48,19 +71,34 @@ function parseLLMResponse(raw: string): {
   return { answer: trimmed, usedSources: [] };
 }
 
-// Relevance threshold for retrieved chunks (0 to 1). Chunks with similarity below this will be discarded.
-const RELEVANCE_THRESHOLD = 0.3;
+// Convert a SlabContentWithSimilarity to a UnifiedChunk
+function slabToUnified(chunk: SlabContentWithSimilarity): UnifiedChunk {
+  return {
+    id: chunk.id,
+    title: chunk.title,
+    chunk_text: chunk.chunk_text,
+    similarity: chunk.similarity,
+    source_url: chunk.slab_url ?? null,
+    source_type: "slab",
+  };
+}
 
-// Interface for the RAG result returned by askQuestion()
-export interface RAGResult {
-  answer: string;
-  sources: SlabContentWithSimilarity[];
+// Convert a GoogleDocsContentWithSimilarity to a UnifiedChunk
+function googleDocsToUnified(chunk: GoogleDocsContentWithSimilarity): UnifiedChunk {
+  return {
+    id: chunk.id,
+    title: chunk.title,
+    chunk_text: chunk.chunk_text,
+    similarity: chunk.similarity,
+    source_url: chunk.doc_url ?? null,
+    source_type: "google_docs",
+  };
 }
 
 // Helper function to build the prompt for the LLM, combining the question and retrieved context chunks.
 function buildPrompt(
   question: string,
-  chunks: SlabContentWithSimilarity[],
+  chunks: UnifiedChunk[],
 ): string {
   const contextBlock = chunks
     .map(
@@ -96,15 +134,14 @@ ${question}`;
 /**
  * Full RAG pipeline:
  * 1. Embed the user's question via Gemini.
- * 2. Query pgvector for the top-N most relevant content chunks.
+ * 2. Query pgvector for the top-N most relevant chunks from BOTH tables.
  * 3. Filter out chunks below the relevance threshold.
- * 4. Build a prompt with the retrieved context and generate an answer.
+ * 4. Expand to all chunks from every matched document.
+ * 5. Build a prompt with the retrieved context and generate an answer.
  *
  * @param question  – the user's natural-language question.
- * @param topN      – how many chunks to retrieve in the initial similarity
- *                    search (default 10). After retrieval, ALL chunks from
- *                    every matched document are fetched and included in the
- *                    prompt (document expansion).
+ * @param topN      – how many chunks to retrieve per source in the initial
+ *                    similarity search (default 10).
  * @returns The generated answer together with the source chunks used.
  */
 export async function askQuestion(
@@ -114,46 +151,82 @@ export async function askQuestion(
   // 1. Convert question into a 768-dim embedding
   const questionEmbedding = await embedText(question);
 
-  // 2. Retrieve the most similar chunks from pgvector
-  const topChunks = await searchByEmbedding(questionEmbedding, topN);
+  // 2. Search both tables simultaneously
+  const [slabChunks, googleDocsChunks] = await Promise.all([
+    searchByEmbedding(questionEmbedding, topN),
+    searchGoogleDocsByEmbedding(questionEmbedding, topN),
+  ]);
 
-  // 3a. Filter out low-relevance results
-  const relevantChunks = topChunks.filter(
+  // 3. Convert to unified format and merge
+  const allChunks: UnifiedChunk[] = [
+    ...slabChunks.map(slabToUnified),
+    ...googleDocsChunks.map(googleDocsToUnified),
+  ];
+
+  // 4a. Filter out low-relevance results
+  const relevantChunks = allChunks.filter(
     (chunk) => chunk.similarity >= RELEVANCE_THRESHOLD,
   );
 
-  // 3b. Document expansion — for every unique document title surfaced by the similarity search, fetch ALL of its chunks from the database.
-  const uniqueTitles = [...new Set(relevantChunks.map((c) => c.title))];
-  const expansionResults = await Promise.all(
-    uniqueTitles.map((title) => getChunksByTitle(title)),
-  );
+  // 4b. Document expansion — fetch ALL chunks from every matched document
+  const uniqueSlabTitles = [
+    ...new Set(
+      relevantChunks
+        .filter((c) => c.source_type === "slab")
+        .map((c) => c.title),
+    ),
+  ];
+  const uniqueGoogleDocsTitles = [
+    ...new Set(
+      relevantChunks
+        .filter((c) => c.source_type === "google_docs")
+        .map((c) => c.title),
+    ),
+  ];
 
-  // Merge the expanded chunks with the original results, deduplicating by id.
-  const seenIds = new Set(relevantChunks.map((c) => c.id));
+  const [slabExpansions, googleDocsExpansions] = await Promise.all([
+    Promise.all(uniqueSlabTitles.map((title) => getChunksByTitle(title))),
+    Promise.all(uniqueGoogleDocsTitles.map((title) => getGoogleDocsChunksByTitle(title))),
+  ]);
+
+  // Merge expanded chunks with original results, deduplicating by id + source_type
+  const seenIds = new Set(relevantChunks.map((c) => `${c.source_type}-${c.id}`));
   const minSimilarityByTitle = new Map<string, number>();
   for (const c of relevantChunks) {
     const prev = minSimilarityByTitle.get(c.title) ?? c.similarity;
     minSimilarityByTitle.set(c.title, Math.min(prev, c.similarity));
   }
 
-  const expandedChunks: SlabContentWithSimilarity[] = [...relevantChunks];
-  for (const docChunks of expansionResults) {
+  const expandedChunks: UnifiedChunk[] = [...relevantChunks];
+
+  for (const docChunks of slabExpansions) {
     for (const chunk of docChunks) {
-      if (!seenIds.has(chunk.id)) {
-        seenIds.add(chunk.id);
+      const key = `slab-${chunk.id}`;
+      if (!seenIds.has(key)) {
+        seenIds.add(key);
         expandedChunks.push({
-          ...chunk,
-          similarity:
-            minSimilarityByTitle.get(chunk.title) ?? RELEVANCE_THRESHOLD,
+          ...slabToUnified({ ...chunk, similarity: minSimilarityByTitle.get(chunk.title) ?? RELEVANCE_THRESHOLD }),
         });
       }
     }
   }
 
-  // Sort expanded set by similarity descending so the most relevant context appears first in the prompt.
+  for (const docChunks of googleDocsExpansions) {
+    for (const chunk of docChunks) {
+      const key = `google_docs-${chunk.id}`;
+      if (!seenIds.has(key)) {
+        seenIds.add(key);
+        expandedChunks.push({
+          ...googleDocsToUnified({ ...chunk, similarity: minSimilarityByTitle.get(chunk.title) ?? RELEVANCE_THRESHOLD }),
+        });
+      }
+    }
+  }
+
+  // Sort by similarity descending
   expandedChunks.sort((a, b) => b.similarity - a.similarity);
 
-  // 4. If nothing relevant was found, return a "no info" answer
+  // 5. If nothing relevant was found, return a "no info" answer
   if (expandedChunks.length === 0) {
     return {
       answer:
@@ -163,11 +236,11 @@ export async function askQuestion(
     };
   }
 
-  // 5. Build the augmented prompt and generate an answer
+  // 6. Build the augmented prompt and generate an answer
   const prompt = buildPrompt(question, expandedChunks);
   const rawAnswer = await generateText(prompt);
 
-  // 6. Parse structured response and keep only the sources the LLM declared it used
+  // 7. Parse structured response and keep only the sources the LLM declared it used
   const { answer, usedSources } = parseLLMResponse(rawAnswer);
 
   const matchedSources =
@@ -177,13 +250,12 @@ export async function askQuestion(
             (title) => title.toLowerCase() === doc.title.toLowerCase(),
           ),
         )
-      : []; // fallback: return none if parsing produced no titles
+      : [];
 
-  // Deduplicate by title, keeping the chunk with the highest similarity score
-  // (a single document may produce multiple chunks that all match the same title)
-  const seenTitles = new Map<string, SlabContentWithSimilarity>();
+  // Deduplicate by title + source_type, keeping the chunk with the highest similarity score
+  const seenTitles = new Map<string, UnifiedChunk>();
   for (const doc of matchedSources) {
-    const key = doc.title.toLowerCase();
+    const key = `${doc.source_type}-${doc.title.toLowerCase()}`;
     const existing = seenTitles.get(key);
     if (!existing || doc.similarity > existing.similarity) {
       seenTitles.set(key, doc);

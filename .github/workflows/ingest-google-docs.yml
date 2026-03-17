@@ -1,0 +1,22 @@
+name: Ingest Google Docs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Trigger Google Docs ingestion
+        env:
+          HOST_URL: ${{ secrets.HOST_URL }}
+          INGEST_SECRET_CODE: ${{ secrets.INGEST_SECRET_CODE }}
+        run: npx tsx scripts/ingest-google-docs.ts

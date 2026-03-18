@@ -84,32 +84,42 @@ async function exportDocAsMarkdown(
   return response.data as string;
 }
 
-// Load all Google Docs from the configured Drive folder and return them with their content.
-// Searches recursively through subfolders.
+// Load all Google Docs from one or more configured Drive folders and return them with their content.
+// GOOGLE_DRIVE_FOLDER_ID supports multiple comma-separated folder IDs e.g. "123,456,789".
+// Searches recursively through subfolders of each folder.
 export async function loadAllGoogleDocs(): Promise<GoogleDoc[]> {
-  const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  const folderIdEnv = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-  if (!folderId) {
+  if (!folderIdEnv) {
     throw new Error(
       "GOOGLE_DRIVE_FOLDER_ID must be set in environment variables.",
     );
   }
 
-  // Create a single auth client and drive instance to reuse across all recursive calls
+  // Support multiple comma-separated folder IDs
+  const folderIds = folderIdEnv.split(",").map((id) => id.trim()).filter(Boolean);
+
+  // Create a single auth client and drive instance to reuse across all calls
   const auth = getAuthClient();
   const drive = google.drive({ version: "v3", auth });
 
-  const files = await listDocsInFolder(folderId, drive);
+  // Collect docs from all folders
+  const allFiles: { id: string; title: string }[] = [];
+  for (const folderId of folderIds) {
+    console.log(`Searching folder: ${folderId}`);
+    const files = await listDocsInFolder(folderId, drive);
+    allFiles.push(...files);
+  }
 
-  if (files.length === 0) {
+  if (allFiles.length === 0) {
     return [];
   }
 
-  console.log(`Found ${files.length} Google Docs in folder.`);
+  console.log(`Found ${allFiles.length} Google Docs across ${folderIds.length} folder(s).`);
 
   const docs: GoogleDoc[] = [];
 
-  for (const file of files) {
+  for (const file of allFiles) {
     console.log(`  Exporting: ${file.title}`);
     const content = await exportDocAsMarkdown(file.id, drive);
     docs.push({

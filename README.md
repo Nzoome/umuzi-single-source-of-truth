@@ -2,6 +2,10 @@
 
 An AI-powered internal knowledge assistant for the Umuzi organisation. It ingests operational documentation (from local Markdown files and Google Docs), chunks it intelligently, generates vector embeddings via Google Gemini, and exposes a RAG (Retrieval-Augmented Generation) pipeline so staff can ask natural-language questions and receive accurate, cited answers through a Slack bot.
 
+## Pipeline Diagram
+
+![Zazu RAG Pipeline](docs/pipeline.png)
+
 ## Goals
 
 1. **Centralise institutional knowledge** — surface information from operational processes, team guidelines, pathways, and people & culture docs in one searchable system.

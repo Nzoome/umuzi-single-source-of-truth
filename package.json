@@ -8,13 +8,15 @@
     "start": "next start",
     "lint": "eslint",
     "ingest": "npx tsx scripts/ingest.ts",
-    "ingest-google-docs": "npx tsx scripts/ingest-google-docs.ts"
+    "ingest-google-docs": "npx tsx scripts/ingest-google-docs.ts",
+    "export-pdfs": "npx tsx scripts/export-pdfs.ts"
   },
   "dependencies": {
     "@google/genai": "^1.41.0",
     "@google/generative-ai": "^0.24.1",
     "@prisma/adapter-pg": "^7.4.2",
     "@prisma/client": "^7.4.2",
+    "datetime": "^0.0.3",
     "dotenv": "^17.4.2",
     "googleapis": "^171.4.0",
     "next": "16.1.6",

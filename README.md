@@ -32,6 +32,7 @@ An AI-powered internal knowledge assistant for the Umuzi organisation. It ingest
 | GitHub Actions — monthly report (`report.yml`)              | ✅ Working (scheduled 28th of each month + `workflow_dispatch`)             |
 | Google Docs ingestion (`POST /api/ingest-google-docs`)      | ✅ Working (fetches docs from Drive folder, chunks + embeds them)           |
 | Google Docs content search in RAG                           | ✅ Working (searches both `slab_content` and `google_docs_content` tables)  |
+| Google Docs PDF export                                      | ✅ Working (converts Slides/Sheets/PPTX/XLSX to PDFs, uploads to Drive)     |
 | GitHub Actions — Google Docs re-ingest (`ingest-google-docs.yml`) | ✅ Working (`workflow_dispatch`)                                      |
 | Production deployment on Render                             | 🔲 Not started                                                              |
 | Slab API integration                                        | 🔲 Not started                                                              |
@@ -43,6 +44,7 @@ Umuzi has a growing body of operational documentation including meeting guidelin
 - **Staff** type a question in a Slack channel (mentioning `@Zazu`) or DM the bot directly (e.g. _"What is the process for setting KPAs?"_).
 - The system converts the question into a 768-dim embedding, searches the vector database for the most relevant document chunks across both Markdown and Google Docs sources, fetches **all chunks** from every matched document (document expansion), and feeds the full context into Google Gemini to produce a concise answer **with citations** (source title + link + relevance %).
 - **Ops & Leadership** can review the `questions_asked` table to see what topics people ask about most, identifying documentation gaps. A formatted Gemini-written report is automatically posted to the configured Slack channel on the **28th of every month**.
+- **Content Management** can export Office documents (PPTX, XLSX, Google Slides, Google Sheets) to PDF format and store them in Google Drive for archival purposes using the PDF export functionality.
 
 ## Current Project Status
 
@@ -96,6 +98,19 @@ questions_asked
 ├── user_id         VARCHAR(255)
 ├── question_text   TEXT
 └── timestamp       TIMESTAMPTZ
+
+SourceFile
+├── id               TEXT PRIMARY KEY (CUID)
+├── fileName         VARCHAR(255) UNIQUE
+├── lastHash         TEXT — SHA-256 fingerprint of file content
+└── updatedAt        TIMESTAMP
+
+Fact
+├── id               TEXT PRIMARY KEY (CUID)
+├── content          TEXT — Atomic unit of information
+├── createdAt        TIMESTAMP
+├── sourceFileId     TEXT — Foreign Key to SourceFile
+└── embedding_vector vector(768) — Future-proofing for fact-based RAG
 ```
 
 Indexes: HNSW on `embedding_vector` (cosine) for both content tables, B-tree on `user_id` and `timestamp`.
@@ -144,6 +159,12 @@ SLACK_CHANNEL_ID=your-slack-channel-id
 
 # Google Drive folder ID (the ID from the folder URL)
 GOOGLE_DRIVE_FOLDER_ID=your-folder-id
+
+# Google Drive folder where exported PDFs are stored
+GOOGLE_DRIVE_PDF_OUTPUT_FOLDER_ID=your-output-folder-id
+
+# Private Key (ensure newline characters are handled)
+GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n..."
 
 # Google Service Account credentials (from the downloaded JSON key file)
 GOOGLE_SERVICE_ACCOUNT_EMAIL=your-service-account@your-project.iam.gserviceaccount.com

@@ -1,5 +1,5 @@
 -- Enable pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
+-- CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Create slab_content table
 CREATE TABLE IF NOT EXISTS "slab_content" (

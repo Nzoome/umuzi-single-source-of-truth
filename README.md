@@ -31,8 +31,9 @@ An AI-powered internal knowledge assistant for the Umuzi organisation. It ingest
 | GitHub Actions — manual re-ingest (`ingest.yml`)            | ✅ Working (`workflow_dispatch`)                                            |
 | GitHub Actions — monthly report (`report.yml`)              | ✅ Working (scheduled 28th of each month + `workflow_dispatch`)             |
 | Google Docs ingestion (`POST /api/ingest-google-docs`)      | ✅ Working (fetches docs from Drive folder, chunks + embeds them)           |
-| Google Docs content search in RAG                           | ✅ Working (searches both `slab_content` and `google_docs_content` tables)  |
-| Google Docs PDF export                                      | ✅ Working (converts Slides/Sheets/PPTX/XLSX to PDFs, uploads to Drive)     |
+| Google Docs content search in RAG                           | ✅ Working (searches `slab_content`, `google_docs_content`, and fact records) |
+| Slides/Sheets fact ingestion                                | ✅ Working (exports Slides/Sheets to PDF in-memory, extracts facts, stores hashes) |
+| GitHub Actions — Drive Slides/Sheets ingest (`ingest-drive-slides-sheets.yml`) | ✅ Working (`workflow_dispatch`)                        |
 | GitHub Actions — Google Docs re-ingest (`ingest-google-docs.yml`) | ✅ Working (`workflow_dispatch`)                                      |
 | Production deployment on Render                             | 🔲 Not started                                                              |
 | Slab API integration                                        | 🔲 Not started                                                              |
@@ -42,20 +43,20 @@ An AI-powered internal knowledge assistant for the Umuzi organisation. It ingest
 Umuzi has a growing body of operational documentation including meeting guidelines, OKR processes, KPA frameworks, deep-work policies, quarterly rituals, and more. Today, finding the right document means searching manually or asking a colleague. This tool replaces that friction:
 
 - **Staff** type a question in a Slack channel (mentioning `@Zazu`) or DM the bot directly (e.g. _"What is the process for setting KPAs?"_).
-- The system converts the question into a 768-dim embedding, searches the vector database for the most relevant document chunks across both Markdown and Google Docs sources, fetches **all chunks** from every matched document (document expansion), and feeds the full context into Google Gemini to produce a concise answer **with citations** (source title + link + relevance %).
+- The system converts the question into a 768-dim embedding, searches the vector database across Markdown chunks, Google Docs chunks, and Slides/Sheets fact records, fetches **all chunks/facts** from every matched document (document expansion), and feeds the full context into Google Gemini to produce a concise answer **with citations** (source title + original source link + relevance %).
 - **Ops & Leadership** can review the `questions_asked` table to see what topics people ask about most, identifying documentation gaps. A formatted Gemini-written report is automatically posted to the configured Slack channel on the **28th of every month**.
-- **Content Management** can export Office documents (PPTX, XLSX, Google Slides, Google Sheets) to PDF format and store them in Google Drive for archival purposes using the PDF export functionality.
+- **Content Management** can run one ingestion pipeline for Google Slides and Sheets where each file is exported to PDF in-memory (no Drive PDF copies), hashed for change detection, and converted into fact records.
 
 ## Current Project Status
 
 The full system is **production-ready** end-to-end:
 
 - **Next.js 16 + TypeScript** project is bootstrapped and compiling.
-- **Database layer** is complete — PostgreSQL with pgvector, managed via Prisma ORM with `@prisma/adapter-pg` for connection pooling, typed repositories for `slab_content`, `google_docs_content`, and `questions_asked`.
+- **Database layer** is complete — PostgreSQL with pgvector, managed via Prisma ORM with `@prisma/adapter-pg` for connection pooling, typed repositories for `slab_content`, `google_docs_content`, `questions_asked`, and fact/source-file records.
 - **Content ingestion pipeline** is functional end-to-end: the `content-reader` recursively loads Markdown files from all six `content/` categories, the `chunker` splits them by `##` section headings into overlapping ~550-word chunks (≈ 730 tokens) with title context prepended, and `POST /api/ingest-markdown` orchestrates clear → chunk → embed → bulk-insert in batches of 50.
 - **Google Docs ingestion pipeline** is functional end-to-end: `POST /api/ingest-google-docs` connects to a configured Google Drive folder via a service account, exports each doc as Markdown, chunks and embeds them using the same pipeline as Markdown files, and stores them in `google_docs_content`.
 - **Google Gemini integration** is complete — `embedText()`, `embedTexts()`, and `embedAllChunks()` generate 768-dim vectors via `gemini-embedding-001`; `generateText()` produces LLM answers via `gemini-3-flash-preview`.
-- **RAG query pipeline** is live — searches both `slab_content` and `google_docs_content` simultaneously, merges and ranks results by similarity, expands to all chunks of matched documents, and builds an augmented prompt asking Gemini for a structured `{ answer, used_sources }` JSON response with deduplicated source citations.
+- **RAG query pipeline** is live — searches `slab_content`, `google_docs_content`, and fact records simultaneously, merges and ranks results by similarity, expands to all chunks/facts of matched documents, and builds an augmented prompt asking Gemini for a structured `{ answer, used_sources }` JSON response with deduplicated source citations.
 - **Slack bot "Zazu"** handles Events API (`app_mention`, DM) via `POST /api/slack`. The route ACKs immediately and processes in the background to satisfy Slack's 3-second timeout.
 - **Monthly reporting** is live — `POST /api/report` fetches the last 30 days of questions, sends them to Gemini for categorisation and trend analysis, and posts a formatted summary to the configured Slack channel.
 - **104 Markdown documents** are in `content/` across six categories: `guidelines/`, `operational-processes/`, `pathways/`, `people-and-culture/`, `projects-and-initiatives/`, and `systems-and-tools/`.
@@ -101,9 +102,12 @@ questions_asked
 
 SourceFile
 ├── id               TEXT PRIMARY KEY (CUID)
-├── fileName         VARCHAR(255) UNIQUE
-├── lastHash         TEXT — SHA-256 fingerprint of file content
-└── updatedAt        TIMESTAMP
+├── driveFileId      VARCHAR(255) UNIQUE
+├── fileName         VARCHAR(255)
+├── mimeType         VARCHAR(255)
+├── driveModifiedTime TIMESTAMP
+├── lastHash         TEXT — SHA-256 fingerprint of exported PDF content
+└── updatedAt        TIMESTAMP (auto-updated)
 
 Fact
 ├── id               TEXT PRIMARY KEY (CUID)
@@ -159,9 +163,6 @@ SLACK_CHANNEL_ID=your-slack-channel-id
 
 # Google Drive folder ID (the ID from the folder URL)
 GOOGLE_DRIVE_FOLDER_ID=your-folder-id
-
-# Google Drive folder where exported PDFs are stored
-GOOGLE_DRIVE_PDF_OUTPUT_FOLDER_ID=your-output-folder-id
 
 # Private Key (ensure newline characters are handled)
 GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n..."
@@ -284,6 +285,7 @@ lib/
   repositories/
     slab-content.ts               → CRUD + vector search + bulk ops for slab_content
     google-docs-content.ts        → CRUD + vector search + bulk ops for google_docs_content
+    facts.ts                      → Fact retrieval + source expansion for Slides/Sheets ingestion
     questions-asked.ts            → CRUD + analytics for questions_asked
 migrations/
   001_initial_schema.sql          → Legacy SQL schema (reference only)
@@ -293,10 +295,12 @@ prisma/
 scripts/
   ingest.ts                       → CLI trigger for POST /api/ingest-markdown
   ingest-google-docs.ts           → CLI trigger for POST /api/ingest-google-docs
+  ingest-drive-slides-sheets.ts   → CLI pipeline: Drive list → PDF export → hash → facts → embeddings
 .github/
   workflows/
     ingest.yml                    → Manual Markdown re-ingest via workflow_dispatch
     ingest-google-docs.yml        → Manual Google Docs re-ingest via workflow_dispatch
+    ingest-drive-slides-sheets.yml → Manual Slides/Sheets fact ingestion via workflow_dispatch
     report.yml                    → Monthly report on the 28th + workflow_dispatch
 ```
 
@@ -361,6 +365,12 @@ Triggered manually via **Actions → Ingest Google Docs → Run workflow**. Call
 
 **Required repository secrets:** `HOST_URL`, `INGEST_SECRET_CODE`
 
+### `ingest-drive-slides-sheets.yml` — Manual Slides/Sheets Fact Ingest
+
+Triggered manually via **Actions → Ingest Drive Slides Sheets → Run workflow**. Runs `scripts/ingest-drive-slides-sheets.ts`, which recursively scans configured Drive folders, exports Slides/Sheets to PDF in-memory, compares hashes, extracts facts, and stores fact embeddings.
+
+**Required repository secrets:** `DATABASE_URL`, `GEMINI_API_KEY`, `GOOGLE_DRIVE_FOLDER_ID`, `GOOGLE_SERVICE_ACCOUNT_EMAIL`, `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
+
 ### `report.yml` — Monthly Usage Report
 
 Runs automatically on the **28th of every month at midnight UTC** and can also be triggered manually. POSTs to `HOST_URL/api/report` with the secret code, which generates a Gemini-written analysis of the last 30 days of questions and posts it to the Slack channel configured in `SLACK_CHANNEL_ID`.
@@ -377,6 +387,7 @@ Runs automatically on the **28th of every month at midnight UTC** and can also b
 | `npm run lint`               | Run ESLint                                   |
 | `npm run ingest`             | Trigger Markdown content ingestion via API   |
 | `npm run ingest-google-docs` | Trigger Google Docs ingestion via API        |
+| `npm run ingest-drive-slides-sheets` | Ingest Drive Slides/Sheets directly into fact store |
 
 ## Next Steps (Roadmap)
 

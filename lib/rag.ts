@@ -7,7 +7,15 @@ import {
   searchGoogleDocsByEmbedding,
   getGoogleDocsChunksByTitle,
 } from "./repositories/google-docs-content";
-import type { SlabContentWithSimilarity, GoogleDocsContentWithSimilarity } from "./db-types";
+import {
+  getFactsBySourceFileId,
+  searchFactsByEmbedding,
+} from "./repositories/facts";
+import type {
+  SlabContentWithSimilarity,
+  GoogleDocsContentWithSimilarity,
+  FactWithSimilarity,
+} from "./db-types";
  
 // Default number of top relevant chunks to retrieve per source. Can be overridden by caller.
 const DEFAULT_TOP_N = 10;
@@ -23,12 +31,12 @@ export interface ConversationMessage {
  
 // Unified source type that works for both Slab and Google Docs content
 export interface UnifiedChunk {
-  id: number;
+  id: number | string;
   title: string;
   chunk_text: string;
   similarity: number;
   source_url: string | null;
-  source_type: "slab" | "google_docs";
+  source_type: "slab" | "google_docs" | "drive_slides_sheets";
 }
  
 // Interface for the RAG result returned by askQuestion()
@@ -98,6 +106,18 @@ function googleDocsToUnified(chunk: GoogleDocsContentWithSimilarity): UnifiedChu
     similarity: chunk.similarity,
     source_url: chunk.doc_url ?? null,
     source_type: "google_docs",
+  };
+}
+
+// Convert a FactWithSimilarity to a UnifiedChunk
+function factToUnified(fact: FactWithSimilarity): UnifiedChunk {
+  return {
+    id: fact.id,
+    title: fact.sourceFile.fileName,
+    chunk_text: fact.content,
+    similarity: fact.similarity,
+    source_url: fact.source_url,
+    source_type: "drive_slides_sheets",
   };
 }
  
@@ -178,7 +198,7 @@ ${question}`;
  * Full RAG pipeline with optional conversation history:
  * 1. If conversation history exists, rewrite the question into a standalone query.
  * 2. Embed the (rewritten) question via Gemini using RETRIEVAL_QUERY task type.
- * 3. Query pgvector for the top-N most relevant chunks from BOTH tables.
+ * 3. Query retrieval sources for top-N relevant chunks/facts (slab, Google Docs, and fact records).
  * 4. Filter out chunks below the relevance threshold.
  * 5. Expand to all chunks from every matched document.
  * 6. Build a prompt with the retrieved context, conversation history, and generate an answer.
@@ -202,16 +222,18 @@ export async function askQuestion(
   // comparing a short query against a database of longer document chunks.
   const questionEmbedding = await embedText(searchQuery, "RETRIEVAL_QUERY");
  
-  // 3. Search both tables simultaneously
-  const [slabChunks, googleDocsChunks] = await Promise.all([
+  // 3. Search all retrieval sources simultaneously
+  const [slabChunks, googleDocsChunks, factChunks] = await Promise.all([
     searchByEmbedding(questionEmbedding, topN),
     searchGoogleDocsByEmbedding(questionEmbedding, topN),
+    searchFactsByEmbedding(questionEmbedding, topN),
   ]);
  
   // 4. Convert to unified format and merge
   const allChunks: UnifiedChunk[] = [
     ...slabChunks.map(slabToUnified),
     ...googleDocsChunks.map(googleDocsToUnified),
+    ...factChunks.map(factToUnified),
   ];
  
   // 5a. Filter out low-relevance results
@@ -234,18 +256,27 @@ export async function askQuestion(
         .map((c) => c.title),
     ),
   ];
+  const uniqueFactSourceIds = [
+    ...new Set(
+      factChunks
+        .filter((c) => c.similarity >= RELEVANCE_THRESHOLD)
+        .map((c) => c.sourceFileId),
+    ),
+  ];
  
-  const [slabExpansions, googleDocsExpansions] = await Promise.all([
+  const [slabExpansions, googleDocsExpansions, factExpansions] = await Promise.all([
     Promise.all(uniqueSlabTitles.map((title) => getChunksByTitle(title))),
     Promise.all(uniqueGoogleDocsTitles.map((title) => getGoogleDocsChunksByTitle(title))),
+    Promise.all(uniqueFactSourceIds.map((sourceFileId) => getFactsBySourceFileId(sourceFileId))),
   ]);
  
   // Merge expanded chunks with original results, deduplicating by id + source_type
   const seenIds = new Set(relevantChunks.map((c) => `${c.source_type}-${c.id}`));
-  const minSimilarityByTitle = new Map<string, number>();
+  const minSimilarityByDocument = new Map<string, number>();
   for (const c of relevantChunks) {
-    const prev = minSimilarityByTitle.get(c.title) ?? c.similarity;
-    minSimilarityByTitle.set(c.title, Math.min(prev, c.similarity));
+    const key = `${c.source_type}-${c.title}`;
+    const prev = minSimilarityByDocument.get(key) ?? c.similarity;
+    minSimilarityByDocument.set(key, Math.min(prev, c.similarity));
   }
  
   const expandedChunks: UnifiedChunk[] = [...relevantChunks];
@@ -256,7 +287,12 @@ export async function askQuestion(
       if (!seenIds.has(key)) {
         seenIds.add(key);
         expandedChunks.push({
-          ...slabToUnified({ ...chunk, similarity: minSimilarityByTitle.get(chunk.title) ?? RELEVANCE_THRESHOLD }),
+          ...slabToUnified({
+            ...chunk,
+            similarity:
+              minSimilarityByDocument.get(`slab-${chunk.title}`) ??
+              RELEVANCE_THRESHOLD,
+          }),
         });
       }
     }
@@ -268,8 +304,36 @@ export async function askQuestion(
       if (!seenIds.has(key)) {
         seenIds.add(key);
         expandedChunks.push({
-          ...googleDocsToUnified({ ...chunk, similarity: minSimilarityByTitle.get(chunk.title) ?? RELEVANCE_THRESHOLD }),
+          ...googleDocsToUnified({
+            ...chunk,
+            similarity:
+              minSimilarityByDocument.get(`google_docs-${chunk.title}`) ??
+              RELEVANCE_THRESHOLD,
+          }),
         });
+      }
+    }
+  }
+
+  for (const docFacts of factExpansions) {
+    for (const fact of docFacts) {
+      const key = `drive_slides_sheets-${fact.id}`;
+      if (!seenIds.has(key)) {
+        seenIds.add(key);
+        const sourceFile = fact.sourceFile as unknown as { driveFileId: string; fileName: string };
+        const sourceUrl = `https://drive.google.com/open?id=${encodeURIComponent(
+          sourceFile.driveFileId,
+        )}`;
+        expandedChunks.push(
+          factToUnified({
+            ...fact,
+            similarity:
+              minSimilarityByDocument.get(
+                `drive_slides_sheets-${sourceFile.fileName}`,
+              ) ?? RELEVANCE_THRESHOLD,
+            source_url: sourceUrl,
+          }),
+        );
       }
     }
   }

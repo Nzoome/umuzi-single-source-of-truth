@@ -67,13 +67,16 @@ model QuestionAsked {
  * The lastHash field acts as the "Gatekeeper" to prevent redundant API costs.
  */
 model SourceFile {
-  id        String   @id @default(cuid())
-  fileName  String   @unique
-  lastHash  String   // SHA-256 fingerprint of the file content
-  updatedAt DateTime @updatedAt
+  id               String    @id @default(cuid())
+  driveFileId      String    @unique // Stable Drive identity, resilient to file renames.
+  fileName         String
+  mimeType         String?
+  driveModifiedTime DateTime? // Mirrors Drive metadata for observability/debugging.
+  lastHash         String    // SHA-256 fingerprint of the exported PDF bytes.
+  updatedAt        DateTime  @updatedAt
   
   // Relation: A source file contains many extracted facts
-  facts     Fact[]
+  facts            Fact[]
 }
 
 /**

@@ -11,6 +11,7 @@ import {
   getFactsBySourceFileId,
   searchFactsByEmbedding,
 } from "./repositories/facts";
+import { buildDriveFileUrl } from "./google-drive";
 import type {
   SlabContentWithSimilarity,
   GoogleDocsContentWithSimilarity,
@@ -321,9 +322,7 @@ export async function askQuestion(
       if (!seenIds.has(key)) {
         seenIds.add(key);
         const sourceFile = fact.sourceFile as unknown as { driveFileId: string; fileName: string };
-        const sourceUrl = `https://drive.google.com/open?id=${encodeURIComponent(
-          sourceFile.driveFileId,
-        )}`;
+        const sourceUrl = buildDriveFileUrl(sourceFile.driveFileId);
         expandedChunks.push(
           factToUnified({
             ...fact,

@@ -1,71 +1,51 @@
 import prisma from "../prisma";
 import type { FactWithSimilarity } from "../db-types";
-
-/**
- * Cosine similarity between two vectors.
- * Returns 0 when vector shapes mismatch or norms are invalid.
- */
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) {
-    return 0;
-  }
-
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  if (!Number.isFinite(denom) || denom === 0) {
-    return 0;
-  }
-
-  return dot / denom;
-}
-
-/**
- * Build a direct URL to the original Google Drive file.
- * This intentionally references the source document itself, not any exported PDF.
- */
-function buildDriveFileUrl(driveFileId: string): string {
-  return `https://drive.google.com/open?id=${encodeURIComponent(driveFileId)}`;
-}
+import { buildDriveFileUrl } from "../google-drive";
 
 /**
  * Search Facts by semantic similarity.
- *
- * Note: we compute cosine similarity in application code to avoid relying on
- * a specific DB vector column type for this newer table while rollout stabilises.
  */
 export async function searchFactsByEmbedding(
   embedding: number[],
   limit: number = 5,
 ): Promise<FactWithSimilarity[]> {
+  const embeddingStr = `[${embedding.join(",")}]`;
+
+  // Pull top-N IDs using pgvector cosine distance in the DB.
+  const hits = await prisma.$queryRaw<
+    Array<{ id: string; similarity: number; sourceFileId: string }>
+  >`
+    SELECT id, sourceFileId, 1 - (embedding_vector <=> ${embeddingStr}::vector) as similarity
+    FROM "Fact"
+    WHERE embedding_vector IS NOT NULL
+    ORDER BY embedding_vector <=> ${embeddingStr}::vector
+    LIMIT ${limit}
+  `;
+
+  if (hits.length === 0) return [];
+
+  const idToSimilarity = new Map(hits.map((h) => [h.id, h.similarity]));
+  const idsInOrder = hits.map((h) => h.id);
+
   const facts = await prisma.fact.findMany({
-    where: {
-      embedding_vector: {
-        isEmpty: false,
-      },
-    },
-    include: {
-      sourceFile: true,
-    },
+    where: { id: { in: idsInOrder } },
+    include: { sourceFile: true },
   });
 
-  const scored: FactWithSimilarity[] = facts
-    .map((fact) => ({
-      ...fact,
-      similarity: cosineSimilarity(embedding, fact.embedding_vector),
-      source_url: buildDriveFileUrl(fact.sourceFile.driveFileId),
-    }))
-    .filter((fact) => Number.isFinite(fact.similarity))
-    .sort((a, b) => b.similarity - a.similarity)
-    .slice(0, limit);
+  const factById = new Map(facts.map((f) => [f.id, f]));
+
+  // Return in similarity order.
+  const scored: FactWithSimilarity[] = idsInOrder
+    .map((id) => {
+      const fact = factById.get(id);
+      if (!fact) return null;
+      return {
+        ...fact,
+        similarity: idToSimilarity.get(id) ?? 0,
+        source_url: buildDriveFileUrl(fact.sourceFile.driveFileId),
+      };
+    })
+    .filter((f): f is FactWithSimilarity => Boolean(f));
 
   return scored;
 }

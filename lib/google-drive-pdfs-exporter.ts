@@ -210,5 +210,6 @@ export async function exportDriveGoogleFileToPdf(
     { responseType: "arraybuffer" },
   );
 
-  return Buffer.from(response.data as ArrayBuffer);
+  // googleapis types don't model arraybuffer export well; treat as bytes.
+  return Buffer.from((response as unknown as { data: ArrayBuffer }).data);
 }

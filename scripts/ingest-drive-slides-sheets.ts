@@ -1,6 +1,8 @@
 import * as dotenv from "dotenv";
+import { randomUUID } from "node:crypto";
 import { google } from "googleapis";
 import type { GoogleGenAI } from "@google/genai";
+import { Prisma } from "../lib/generated/prisma";
 import {
   exportDriveGoogleFileToPdf,
   getAuthClient,
@@ -8,7 +10,7 @@ import {
   resolveSourceFolderIds,
   type DriveFile,
 } from "../lib/google-drive-pdfs-exporter";
-import type { Prisma, PrismaClient } from "../lib/generated/prisma";
+import type { PrismaClient } from "../lib/generated/prisma";
 
 dotenv.config({ path: ".env.local" });
 
@@ -76,6 +78,31 @@ Each string must be one concise, atomic, and standalone fact.
 Do not invent facts.
 Remove duplicates and near-duplicates.
 Skip purely decorative or repeated footer/header text.
+
+Standalone requirement (strict):
+- Every fact must be understandable in isolation, without needing the document title, surrounding rows/slides, or prior facts.
+- Every fact must include a clear subject/entity (for example: project name, team, person, role, system, policy, process, metric, or document section).
+- Replace vague references (for example: "it", "this", "they", "the project", "the team") with explicit names from the document whenever possible.
+- Include relevant context when applicable: scope, timeframe/date period, ownership/responsible party, and purpose/intent.
+- First attempt to rewrite a candidate statement into a self-contained fact using visible information; only skip it if that still cannot be done reliably.
+
+Specificity requirement:
+- Avoid vague qualifiers such as "significant", "various", "several", "many", "strong", or "core" unless the document itself specifies what they mean.
+- Prefer concrete, specific facts over high-level summaries when more precise details are visible.
+- Include relationships between entities whenever possible, for example: person -> role -> project, metric -> target -> timeframe, team -> responsibility -> system/process.
+- Prefer explicit numbers, names, thresholds, dates, owners, statuses, and linked entities over abstract summaries.
+
+Deduplication requirement:
+- Remove, merge, or avoid semantically equivalent facts even if they are phrased differently.
+- If two candidate facts express the same meaning, keep the more specific and informative version.
+
+Examples:
+- Bad: "The budget is 10,000 rand."
+- Good: "The Umuzi Career Sprint pilot budget for Q3 2026 is 10,000 rand."
+- Bad: "It must be approved before launch."
+- Good: "The website overhaul launch plan must be approved by the Product Lead before launch."
+- Bad: "The project received significant investment."
+- Good: "The Innovation Strategy 2026 project received a 2 million rand budget allocation for the 2026 financial year."
 `.trim();
 
   if (sourceType === "slides") {
@@ -127,17 +154,26 @@ async function extractFactsFromPdf(
 }> {
   const prompt = buildFactExtractionPrompt(sourceType);
 
+  type GenerateContentArgs = Parameters<GoogleGenAI["models"]["generateContent"]>[0];
+
   const result = await withRetry(
     async () =>
+      // Treat extraction instructions as a system message, and the PDF as user-provided input.
+      // The Gemini SDK supports role-based "contents" for clearer separation of instructions.
       genai.models.generateContent({
         model: CHAT_MODEL,
         contents: [
-          { text: prompt },
+          { role: "system", parts: [{ text: prompt }] },
           {
-            inlineData: {
-              data: pdfBuffer.toString("base64"),
-              mimeType: "application/pdf",
-            },
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  data: pdfBuffer.toString("base64"),
+                  mimeType: "application/pdf",
+                },
+              },
+            ],
           },
         ],
         config: {
@@ -147,7 +183,7 @@ async function extractFactsFromPdf(
             items: { type: "string" },
           },
         },
-      }),
+      } as unknown as GenerateContentArgs),
     "Gemini fact extraction",
   );
 
@@ -198,15 +234,25 @@ async function upsertFileFacts(
 
   await tx.fact.deleteMany({ where: { sourceFileId: sourceFile.id } });
 
-  for (let index = 0; index < facts.length; index++) {
-    await tx.fact.create({
-      data: {
-        content: facts[index],
-        sourceFileId: sourceFile.id,
-        embedding_vector: embeddings[index],
-      },
-    });
-  }
+  if (facts.length === 0) return;
+
+  // NOTE: We intentionally do NOT use tx.fact.createMany here.
+  // Fact.embedding_vector is pgvector (vector(768)) and Prisma marks it as Unsupported.
+  // With createMany, Prisma serializes number[] as a Postgres array literal ("{...}"),
+  // which pgvector rejects ("invalid input syntax for type vector").
+  // Also include explicit IDs because Prisma's @default(cuid()) is client-side behavior,
+  // not a guaranteed DB default for raw SQL inserts.
+  // Bulk SQL with explicit ::vector casting is currently the reliable write path.
+  await tx.$executeRaw`
+    INSERT INTO "Fact" ("id", "content", "sourceFileId", "embedding_vector")
+    VALUES ${Prisma.join(
+      facts.map((content, index) => {
+        const id = randomUUID();
+        const embeddingStr = `[${embeddings[index].join(",")}]`;
+        return Prisma.sql`(${id}, ${content}, ${sourceFile.id}, ${embeddingStr}::vector)`;
+      }),
+    )}
+  `;
 }
 
 /**

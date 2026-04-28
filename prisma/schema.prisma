@@ -93,5 +93,5 @@ model Fact {
   sourceFileId String
   
   // Future-proofing: Vector for RAG retrieval
-  embedding_vector Float[]
+  embedding_vector Unsupported("vector(768)")?
 }
